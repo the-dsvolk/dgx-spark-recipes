@@ -1,0 +1,6 @@
+transformers>=4.57.1
+peft
+datasets
+trl>=0.25.1
+huggingface_hub
+# bitsandbytes: installed separately in Dockerfile (CUDA 13.2 aarch64 wheel)
