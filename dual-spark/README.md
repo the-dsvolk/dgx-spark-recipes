@@ -45,7 +45,10 @@ This recipe is written in the order we actually built it up:
 
 Each box is a GB10 with **128 GB unified LPDDR5X**. The NVFP4 checkpoint is ~75 GB and *fits on a
 single box*, so TP=2 here is primarily for **more KV / context / concurrency headroom**, not because
-the weights don't fit. (A single-node TP=1 deployment is a valid, simpler fallback.)
+the weights don't fit. **Single-node fallback:** [`launch-single-spark.sh`](./launch-single-spark.sh)
+runs Nemotron TP=1 on the *worker* node only (no RoCE/NCCL needed), leaving the primary/head node
+free — e.g. to keep qmx's Ollama/reranker running there. (For single-stream latency, one node is
+about as fast as two anyway; TP=2 mainly helps concurrency + KV capacity.)
 
 ---
 
