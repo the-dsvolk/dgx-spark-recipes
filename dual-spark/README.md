@@ -221,6 +221,12 @@ We chose **vLLM** because:
 The official image does **not** ship Ray. vLLM's native multi-node path uses the **multiprocessing
 (`mp`)** executor with a head/worker split — no Ray required.
 
+> **Shortcut:** [`launch-dual-spark.sh`](./launch-dual-spark.sh) in this directory wraps everything
+> below — it enforces **identical engine args on every node** and maps the **RDMA devices** in, so
+> the two big foot-guns can't happen. Just `./launch-dual-spark.sh up` (built-in Nemotron-Super
+> recipe), `./launch-dual-spark.sh up -- <serve args>` for a custom model, `down`, or `status`. The
+> manual steps below document exactly what it does.
+
 ### 4.0 Performance & stability flags (why the extra `docker run` bits)
 
 The launch below adds a few DGX-Spark-specific flags beyond the bare minimum. Each earns its place:
