@@ -221,6 +221,19 @@ We chose **vLLM** because:
 The official image does **not** ship Ray. vLLM's native multi-node path uses the **multiprocessing
 (`mp`)** executor with a head/worker split — no Ray required.
 
+### 4.0 Performance & stability flags (why the extra `docker run` bits)
+
+The launch below adds a few DGX-Spark-specific flags beyond the bare minimum. Each earns its place:
+
+| Flag | Why |
+| --- | --- |
+| `-v ~/.cache/{vllm,flashinfer} ~/.triton ~/.tilelang` | **Persist the compile caches.** Otherwise every relaunch redoes `torch.compile` (~30 s) + CUDA-graph capture + FlashInfer JIT. Mounting them makes restarts near-instant. |
+| `--load-format fastsafetensors` | Spark's MMAP is slow; the fastsafetensors loader cuts cold weight-load time. **Caveat:** don't use it if a node's shard exceeds ~0.85 of RAM (risk of OOM) — fine here (~37 GB/node under TP=2). |
+| `-e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | Reduces CUDA allocator fragmentation on GB10 **unified** memory. |
+| `--ulimit nofile=1048576:1048576` | Avoids "too many open files" when many shards are opened in parallel. |
+| `--ulimit memlock=-1 --cap-add=IPC_LOCK --device=/dev/infiniband/*` | **Required for RoCE** (see [2.5](#25-nccl--rdma-environment) / [4.3](#43-critical-gotchas)). |
+| `--log-opt max-size=50m --log-opt max-file=3` | Cap container logs so they can't fill the disk. |
+
 ### 4.1 Prep both nodes
 
 ```bash
@@ -246,20 +259,24 @@ Both nodes run the **same engine args**; they differ only in `--node-rank` (0 vs
 ```bash
 docker run -d --name vllm-head --network host --gpus all --ipc=host \
   --log-opt max-size=50m --log-opt max-file=3 \
-  --cap-add=IPC_LOCK --ulimit memlock=-1:-1 \
+  --cap-add=IPC_LOCK --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 \
   --device=/dev/infiniband/rdma_cm \
   --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 \
   --device=/dev/infiniband/uverbs2 --device=/dev/infiniband/uverbs3 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ~/.cache/vllm:/root/.cache/vllm -v ~/.cache/flashinfer:/root/.cache/flashinfer \
+  -v ~/.triton:/root/.triton -v ~/.tilelang:/root/.tilelang \
   -e VLLM_HOST_IP=192.168.100.1 \
   -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_DISABLE=0 \
   -e NCCL_SOCKET_IFNAME=enp1s0f0np0,enP2p1s0f0np0 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --entrypoint vllm vllm/vllm-openai:cu130-nightly \
   serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
     --served-model-name nemotron-3-super --trust-remote-code \
     --tensor-parallel-size 2 --distributed-executor-backend mp \
     --nnodes 2 --node-rank 0 --master-addr 192.168.100.1 --master-port 29500 \
     --max-model-len 131072 --gpu-memory-utilization 0.85 --max-num-seqs 4 \
+    --load-format fastsafetensors \
     --reasoning-parser nemotron_v3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
     --host 0.0.0.0 --port 8000
 ```
@@ -269,20 +286,24 @@ docker run -d --name vllm-head --network host --gpus all --ipc=host \
 ```bash
 docker run -d --name vllm-worker --network host --gpus all --ipc=host \
   --log-opt max-size=50m --log-opt max-file=3 \
-  --cap-add=IPC_LOCK --ulimit memlock=-1:-1 \
+  --cap-add=IPC_LOCK --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 \
   --device=/dev/infiniband/rdma_cm \
   --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 \
   --device=/dev/infiniband/uverbs2 --device=/dev/infiniband/uverbs3 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ~/.cache/vllm:/root/.cache/vllm -v ~/.cache/flashinfer:/root/.cache/flashinfer \
+  -v ~/.triton:/root/.triton -v ~/.tilelang:/root/.tilelang \
   -e VLLM_HOST_IP=192.168.100.2 \
   -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_DISABLE=0 \
   -e NCCL_SOCKET_IFNAME=enp1s0f0np0,enP2p1s0f0np0 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --entrypoint vllm vllm/vllm-openai:cu130-nightly \
   serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
     --served-model-name nemotron-3-super --trust-remote-code \
     --tensor-parallel-size 2 --distributed-executor-backend mp \
     --nnodes 2 --node-rank 1 --master-addr 192.168.100.1 --master-port 29500 \
     --max-model-len 131072 --gpu-memory-utilization 0.85 --max-num-seqs 4 \
+    --load-format fastsafetensors \
     --reasoning-parser nemotron_v3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
     --headless
 ```
@@ -309,6 +330,20 @@ docker run -d --name vllm-worker --network host --gpus all --ipc=host \
 4. **JIT / cold start.** First boot loads ~75 GB of weights (a few minutes) + `torch.compile`
    (~30 s) + CUDA-graph capture; the first request triggers extra JIT. Fire a `max_tokens=3` warm-up
    before real traffic. Warm caches make subsequent launches much faster.
+
+### 4.4 Stability & known issues (DGX Spark)
+
+- **NCCL library load-order (official image).** The official image can ship a pip `libnccl.so.2`
+  that shadows the system `libnccl2`, a known cause of **multi-node NCCL hangs** on DGX Spark
+  ([vllm#42354](https://github.com/vllm-project/vllm/issues/42354)). We didn't hit it, but if the
+  cluster hangs at init, redirect NCCL to the system soname (the `spark-vllm-docker`
+  `use-official-vllm` mod does this automatically).
+- **Driver:** use **580.x** — 590.x has a CUDA-graph capture deadlock on GB10 unified memory. Keep
+  both nodes on the **same** driver version (mismatched minors are best avoided).
+- **Firmware sudden-shutdown under heavy inference:** if a node power-cycles under load, cap the GPU
+  clock, e.g. `sudo nvidia-smi -lgc 200,2150` (resets on reboot).
+- **OOM guard:** consider running `earlyoom` alongside the container for sustained/high-concurrency
+  load (guards against the host-RAM creep that can hard-crash the box).
 
 ---
 
@@ -355,3 +390,24 @@ Weights stay cached in `~/.cache/huggingface`, so relaunching is fast.
 | `--reasoning-parser` | `nemotron_v3` | split reasoning vs content |
 | `--tool-call-parser` | `qwen3_coder` | structured tool calls |
 | `--kv-cache-dtype` | (auto `fp8`) | model config enables fp8 KV |
+| `--load-format` | `fastsafetensors` | faster cold weight load on Spark |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | less allocator fragmentation on unified memory |
+| `--ulimit nofile` | `1048576` | avoid "too many open files" for sharded loads |
+
+---
+
+## Credits & further tooling
+
+This recipe is a hand-rolled, "understand-every-flag" walkthrough. For day-to-day use, the community
+**[`eugr/spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker)** project is worth adopting:
+its `launch-cluster.sh` / `run-recipe.sh` **auto-inject identical args to every node** and **expose
+`/dev/infiniband` automatically** — i.e. it structurally prevents the two mistakes that cost us the
+most here (mismatched per-node args → CUDA-graph deadlock; missing RDMA devices → silent TCP
+fallback). It also adds node autodiscovery, parallel model distribution over the IB link
+(`hf-download.sh -c --copy-parallel`), the compile-cache mounts, `earlyoom`, and the NCCL soname
+fix — and defaults to the same no-Ray multi-node path used above. A `nemotron-3-super-nvfp4` recipe
+exists there too (it uses Marlin kernels; we used FlashInfer-CUTLASS, which the newer `cu130-nightly`
+handles cleanly).
+
+**Recommendation:** keep this README as the from-scratch reference for *how it works*, but drive
+actual launches with that launcher (or copy its patterns) to avoid the foot-guns.
