@@ -42,6 +42,15 @@ the weights don't fit. (A single-node TP=1 deployment is a valid, simpler fallba
   [RoCE](#2-roce--the-connectx-7-fabric)).
 - Both nodes on the same management LAN (Wi-Fi/Ethernet) for internet + control.
 
+**Verified software/firmware levels (both nodes, kept identical):**
+
+| Component | Version |
+| --- | --- |
+| NVIDIA driver | **580.173.02** (`nvidia-driver-580-open`; 580.x pinned, 590.x blocked) |
+| ConnectX-7 NIC firmware | **28.45.4028** |
+| DGX OS | **7.5.0** (SWBUILD 7.2.3), Ubuntu 24.04.4 LTS, kernel 6.17 |
+| Serving image | `vllm/vllm-openai:cu130-nightly` + [`Dockerfile.nccl-fix`](./Dockerfile.nccl-fix) → `vllm-spark-nccl:cu130` |
+
 ```
         management LAN (mDNS: spark-a.local / spark-b.local)
    ┌────────────┐                              ┌────────────┐
@@ -350,8 +359,22 @@ docker run -d --name vllm-worker --network host --gpus all --ipc=host \
   at the system lib: see [`Dockerfile.nccl-fix`](./Dockerfile.nccl-fix). Build it once with
   `./launch-dual-spark.sh build` (the launcher then runs the fixed `vllm-spark-nccl:cu130` image by
   default). **Verified:** the exact request that hung twice on the stock image ran clean afterward.
-- **Driver:** use **580.x** — 590.x has a CUDA-graph capture deadlock on GB10 unified memory. Keep
-  both nodes on the **same** driver version (mismatched minors are best avoided).
+- **Driver — pin to 580.x (verified `580.173.02`).** 590.x has a CUDA-graph capture deadlock on
+  GB10 unified memory, and 590 packages *are* in the repo, so pin it or `apt`/the DGX Dashboard can
+  drift. Drop `/etc/apt/preferences.d/nvidia-pin-580.pref`:
+  ```
+  Package: *nvidia*
+  Pin: version 580.*
+  Pin-Priority: 1001
+
+  Package: *nvidia*
+  Pin: version 590.*
+  Pin-Priority: -1
+  ```
+  Verify: `apt-cache policy nvidia-driver-590-open` then shows `Candidate: (none)`. Keep both nodes
+  identical. **Updating from the CLI** (the shell form of the DGX Dashboard / NVIDIA Sync update):
+  `sudo apt update && sudo apt dist-upgrade` (OS + driver), then `sudo fwupdmgr refresh && sudo
+  fwupdmgr upgrade` (platform firmware), then `sudo reboot`. NIC firmware here is **28.45.4028**.
 - **Firmware sudden-shutdown under heavy inference:** if a node power-cycles under load, cap the GPU
   clock, e.g. `sudo nvidia-smi -lgc 200,2150` (resets on reboot).
 - **OOM guard:** consider running `earlyoom` alongside the container for sustained/high-concurrency
