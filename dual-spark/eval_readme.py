@@ -6,7 +6,7 @@ Usage:
     ./eval_readme.py [path-to-doc]        # defaults to README.md next to this script
 
 Environment overrides:
-    VLLM_URL    default http://spark-0e81.local:8000/v1/chat/completions
+    VLLM_URL    default http://spark-a.local:8000/v1/chat/completions
     VLLM_MODEL  default nemotron-3-super
     MAX_TOKENS  default 4000   (reviews are verbose; Nemotron also uses a reasoning channel)
 
@@ -21,7 +21,7 @@ import sys
 import time
 import urllib.request
 
-URL = os.environ.get("VLLM_URL", "http://spark-0e81.local:8000/v1/chat/completions")
+URL = os.environ.get("VLLM_URL", "http://spark-a.local:8000/v1/chat/completions")
 MODEL = os.environ.get("VLLM_MODEL", "nemotron-3-super")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4000"))
 

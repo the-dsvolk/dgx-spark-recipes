@@ -11,9 +11,23 @@ This recipe is written in the order we actually built it up:
 3. **Why vLLM** (vs TensorRT-LLM / SGLang, and why not Ollama) — and why Nemotron-Super + TP=2.
 4. **Deployment** — the exact multi-node launch, the gotchas, validation, and teardown.
 
-> Conventions: the two nodes are called **`spark-a`** (head, rank 0) and **`spark-b`**
-> (worker, rank 1). Substitute your own hostnames. Example RFC-1918 addresses are used throughout —
-> adapt to your LAN. **No secrets (passwords / tokens / keys) appear in this repo by design.**
+> Conventions: the two nodes are **`spark-a`** (head, rank 0) and **`spark-b`** (worker, rank 1) —
+> these are *role labels only*. **Every site-specific hostname/IP lives in one file, `cluster.env`**
+> (copy from [`cluster.env.example`](./cluster.env.example); it is git-ignored). The commands below
+> reference `$VARIABLES` from it — `source ./cluster.env` first, or let
+> [`launch-dual-spark.sh`](./launch-dual-spark.sh) read it for you. Only the `.example` (with generic
+> values) is committed — **no real IPs, passwords, tokens, or keys are in this repo.**
+
+### Cluster variables (all defined in `cluster.env`)
+
+| Variable | Meaning | Example |
+| --- | --- | --- |
+| `HEAD_HOST` / `WORKER_HOST` | SSH names (rank 0 / rank 1) | `spark-a.local` / `spark-b.local` |
+| `HEAD_RAIL0_IP` / `WORKER_RAIL0_IP` | RoCE rail 0 (port p0, PCIe dom 0000) | `192.168.100.1` / `192.168.100.2` |
+| `HEAD_RAIL1_IP` / `WORKER_RAIL1_IP` | RoCE rail 1 (PCIe dom 0002) | `192.168.101.1` / `192.168.101.2` |
+| `MASTER_IP` / `MASTER_PORT` | NCCL rendezvous (= `HEAD_RAIL0_IP`) / port | `192.168.100.1` / `29500` |
+| `SERVE_PORT` | OpenAI API port (on head) | `8000` |
+| `IB_HCA` / `IB_IFACES` / `IB_GID_INDEX` | RoCE HCAs / netdevs / RoCEv2 GID | `rocep1s0f0,roceP2p1s0f0` / … / `3` |
 
 ---
 
@@ -26,7 +40,7 @@ This recipe is written in the order we actually built it up:
 | Quant | **NVFP4** weights (Blackwell-native), **fp8** KV cache |
 | Context | up to **131,072** tokens |
 | Interconnect | direct **ConnectX-7 200 GbE** QSFP, **RoCEv2** (no switch) |
-| Serving | vLLM OpenAI-compatible API on `spark-a:8000` |
+| Serving | vLLM OpenAI-compatible API on `$HEAD_HOST:$SERVE_PORT` |
 | Decode | ~mid-20s tok/s single-stream (matches NVIDIA's single-Spark eval) |
 
 Each box is a GB10 with **128 GB unified LPDDR5X**. The NVFP4 checkpoint is ~75 GB and *fits on a
@@ -67,23 +81,23 @@ the weights don't fit. (A single-node TP=1 deployment is a valid, simpler fallba
 Multi-node vLLM does **not** need inter-node SSH at runtime (the ranks talk over the RoCE fabric),
 but passwordless SSH makes orchestration (launching, log tailing) far easier.
 
-From your workstation, both boxes are reachable by their mDNS names (`spark-a.local`,
-`spark-b.local`) and log in as the same user on both (a **same username on both nodes** is required
-by the NVIDIA multi-node tooling).
+From your workstation, both boxes are reachable by their mDNS names (`$HEAD_HOST` / `$WORKER_HOST`)
+and you log in as the **same user** on both (`$SSH_USER` — a same username on both nodes is required
+by the NVIDIA multi-node tooling). `source ./cluster.env` first to use the variables below.
 
 Distribute your public key once so subsequent logins need no password:
 
 ```bash
 # one-time: you'll be prompted for the node's login password ONCE, then never again
-ssh-copy-id <user>@spark-a.local
-ssh-copy-id <user>@spark-b.local
+ssh-copy-id "$SSH_USER@$HEAD_HOST"
+ssh-copy-id "$SSH_USER@$WORKER_HOST"
 ```
 
 Verify:
 
 ```bash
-ssh -o BatchMode=yes <user>@spark-a.local 'hostname'   # must NOT prompt for a password
-ssh -o BatchMode=yes <user>@spark-b.local 'hostname'
+ssh -o BatchMode=yes "$SSH_USER@$HEAD_HOST" hostname   # must NOT prompt for a password
+ssh -o BatchMode=yes "$SSH_USER@$WORKER_HOST" hostname
 ```
 
 Notes / gotchas:
@@ -127,20 +141,22 @@ reached by one port's two rails) — a second cable is only for 3–4-node ring/
 Give each rail an address on **both** nodes. Create `/etc/netplan/99-connectx.yaml`
 (`chmod 600`, then `sudo netplan apply`). We used one subnet per rail:
 
+On the **head** use `HEAD_RAIL{0,1}_IP`; on the **worker** use `WORKER_RAIL{0,1}_IP` (values from
+`cluster.env`). Netplan is static YAML, so substitute the literals in — head example:
+
 ```yaml
-# spark-a (use .2 on spark-b)
 network:
   version: 2
   renderer: NetworkManager
   ethernets:
-    enp1s0f0np0:      # rail 0
+    enp1s0f0np0:      # rail 0  (IB_IFACES[0])
       optional: true
       mtu: 9000        # jumbo frames (optional; RoCE MTU is 4096 regardless)
-      addresses: [192.168.100.1/24]
-    enP2p1s0f0np0:    # rail 1
+      addresses: [<HEAD_RAIL0_IP>/24]
+    enP2p1s0f0np0:    # rail 1  (IB_IFACES[1])
       optional: true
       mtu: 9000
-      addresses: [192.168.101.1/24]
+      addresses: [<HEAD_RAIL1_IP>/24]
 ```
 
 `optional: true` keeps boot from waiting on the link when the peer is off. NVIDIA's own playbook
@@ -153,10 +169,10 @@ consistent.
 # link is up at 200G, DAC cable
 ethtool enp1s0f0np0 | grep -E "Speed|Duplex|Link detected"   # Speed: 200000Mb/s, Link detected: yes
 # IP reachability + jumbo frames end-to-end (DF-bit, 8972B payload for MTU 9000)
-ping -c3 -M do -s 8972 192.168.100.2                          # 0% loss
+ping -c3 -M do -s 8972 "$WORKER_RAIL0_IP"                     # 0% loss (jumbo frames)
 # RDMA loopback bandwidth (install perftest); server on peer, client here:
 #   peer:  ib_write_bw -d roceP2p1s0f0 -F -R -q 4 --report_gbits
-#   here:  ib_write_bw -d roceP2p1s0f0 -F -R -q 4 --report_gbits 192.168.101.2
+#   here:  ib_write_bw -d roceP2p1s0f0 -F -R -q 4 --report_gbits "$WORKER_RAIL1_IP"
 ```
 
 ### 2.4 What to expect — the PCIe ceiling
@@ -254,22 +270,26 @@ The launch below adds a few DGX-Spark-specific flags beyond the bare minimum. Ea
 ### 4.1 Prep both nodes
 
 ```bash
-# identical image on both (pin the digest you validated)
-docker pull vllm/vllm-openai:cu130-nightly
+source ./cluster.env                   # hostnames/IPs/images/ports as $VARS
 
-# authenticate to Hugging Face (needed for the gated NVIDIA repo) — token stays local, NOT in git
-export HF_TOKEN=...          # or: hf auth login
+# 1) build the NCCL-fixed image ($IMAGE) on BOTH nodes — see Dockerfile.nccl-fix / §4.4
+./launch-dual-spark.sh build           # or per node: docker build -t "$IMAGE" - < Dockerfile.nccl-fix
 
-# pre-stage weights into each node's HF cache ("download once per node")
+# 2) authenticate to Hugging Face (gated NVIDIA repo) — token stays local, NOT in git
+export HF_TOKEN=...                     # or: hf auth login
+
+# 3) pre-stage weights into each node's HF cache ("download once per node")
 docker run --rm -v ~/.cache/huggingface:/root/.cache/huggingface \
-  --entrypoint hf vllm/vllm-openai:cu130-nightly \
+  --entrypoint hf "$BASE_IMAGE" \
   download nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
 ```
 
 ### 4.2 Launch
 
-Both nodes run the **same engine args**; they differ only in `--node-rank` (0 vs 1) and
-`--headless` (worker). `master-addr` is a **RoCE** IP on the head.
+Both nodes run the **same engine args**; they differ only in `--node-rank` (0 vs 1), `--headless`
+(worker), and `VLLM_HOST_IP` (each node's own rail-0 IP). `--master-addr` is the head's rail-0 IP.
+**`source ./cluster.env`** first so the `$VARS`/`$IMAGE` below resolve — or just use
+`./launch-dual-spark.sh up`, which does exactly this.
 
 **Head (`spark-a`, rank 0):**
 
@@ -283,22 +303,22 @@ docker run -d --name vllm-head --network host --gpus all --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/.cache/vllm:/root/.cache/vllm -v ~/.cache/flashinfer:/root/.cache/flashinfer \
   -v ~/.triton:/root/.triton -v ~/.tilelang:/root/.tilelang \
-  -e VLLM_HOST_IP=192.168.100.1 \
-  -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_DISABLE=0 \
-  -e NCCL_SOCKET_IFNAME=enp1s0f0np0,enP2p1s0f0np0 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 \
+  -e VLLM_HOST_IP=$HEAD_RAIL0_IP \
+  -e NCCL_IB_HCA=$IB_HCA -e NCCL_IB_GID_INDEX=$IB_GID_INDEX -e NCCL_IB_DISABLE=0 \
+  -e NCCL_SOCKET_IFNAME=$IB_IFACES -e GLOO_SOCKET_IFNAME=$GLOO_IF \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  --entrypoint vllm vllm/vllm-openai:cu130-nightly \
+  --entrypoint vllm "$IMAGE" \
   serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
     --served-model-name nemotron-3-super --trust-remote-code \
     --tensor-parallel-size 2 --distributed-executor-backend mp \
-    --nnodes 2 --node-rank 0 --master-addr 192.168.100.1 --master-port 29500 \
+    --nnodes 2 --node-rank 0 --master-addr $MASTER_IP --master-port $MASTER_PORT \
     --max-model-len 131072 --gpu-memory-utilization 0.85 --max-num-seqs 4 \
     --load-format fastsafetensors \
     --reasoning-parser nemotron_v3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-    --host 0.0.0.0 --port 8000
+    --host 0.0.0.0 --port $SERVE_PORT
 ```
 
-**Worker (`spark-b`, rank 1) — identical args, `--node-rank 1 --headless`, `VLLM_HOST_IP=192.168.100.2`:**
+**Worker (`spark-b`, rank 1) — identical args, but `--node-rank 1 --headless` and `VLLM_HOST_IP=$WORKER_RAIL0_IP`:**
 
 ```bash
 docker run -d --name vllm-worker --network host --gpus all --ipc=host \
@@ -310,15 +330,15 @@ docker run -d --name vllm-worker --network host --gpus all --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/.cache/vllm:/root/.cache/vllm -v ~/.cache/flashinfer:/root/.cache/flashinfer \
   -v ~/.triton:/root/.triton -v ~/.tilelang:/root/.tilelang \
-  -e VLLM_HOST_IP=192.168.100.2 \
-  -e NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 -e NCCL_IB_GID_INDEX=3 -e NCCL_IB_DISABLE=0 \
-  -e NCCL_SOCKET_IFNAME=enp1s0f0np0,enP2p1s0f0np0 -e GLOO_SOCKET_IFNAME=enp1s0f0np0 \
+  -e VLLM_HOST_IP=$WORKER_RAIL0_IP \
+  -e NCCL_IB_HCA=$IB_HCA -e NCCL_IB_GID_INDEX=$IB_GID_INDEX -e NCCL_IB_DISABLE=0 \
+  -e NCCL_SOCKET_IFNAME=$IB_IFACES -e GLOO_SOCKET_IFNAME=$GLOO_IF \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  --entrypoint vllm vllm/vllm-openai:cu130-nightly \
+  --entrypoint vllm "$IMAGE" \
   serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
     --served-model-name nemotron-3-super --trust-remote-code \
     --tensor-parallel-size 2 --distributed-executor-backend mp \
-    --nnodes 2 --node-rank 1 --master-addr 192.168.100.1 --master-port 29500 \
+    --nnodes 2 --node-rank 1 --master-addr $MASTER_IP --master-port $MASTER_PORT \
     --max-model-len 131072 --gpu-memory-utilization 0.85 --max-num-seqs 4 \
     --load-format fastsafetensors \
     --reasoning-parser nemotron_v3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
@@ -385,11 +405,12 @@ docker run -d --name vllm-worker --network host --gpus all --ipc=host \
 ## 5. Validate
 
 ```bash
+source ./cluster.env    # $HEAD_HOST / $SERVE_PORT
 # model listed?
-curl -s http://spark-a.local:8000/v1/models | python3 -m json.tool
+curl -s "http://$HEAD_HOST:$SERVE_PORT/v1/models" | python3 -m json.tool
 
 # chat (Nemotron emits a separate reasoning trace via the nemotron_v3 parser)
-curl -s http://spark-a.local:8000/v1/chat/completions \
+curl -s "http://$HEAD_HOST:$SERVE_PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d '{"model":"nemotron-3-super","messages":[{"role":"user","content":"What is 2+2? Answer briefly."}],"max_tokens":256,"temperature":0}'
 # -> choices[0].message.content == "4."   (and .reasoning holds the thinking trace)

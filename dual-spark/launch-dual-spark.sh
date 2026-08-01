@@ -10,6 +10,8 @@
 # The launcher only differs per node by: --node-rank, --headless (workers),
 # --host/--port (head), and VLLM_HOST_IP. Everything else is identical.
 #
+# Config: copy cluster.env.example -> cluster.env and set your hostnames/IPs.
+#
 # Usage:
 #   ./launch-dual-spark.sh build                  # build the system-NCCL-fixed image (once)
 #   ./launch-dual-spark.sh up                     # built-in Nemotron-Super recipe
@@ -17,24 +19,33 @@
 #   ./launch-dual-spark.sh down
 #   ./launch-dual-spark.sh status
 #
-# Config via env (defaults match this repo's dual-Spark setup):
-#   NODES, ROCE_IPS (head first, same order), IMAGE, PORT, MASTER_PORT,
-#   IB_HCA, IB_GID_INDEX, IB_IFACES, GLOO_IF, UVERBS
+# Site-specific values (hostnames, RoCE IPs, ports, IB knobs, images) live in
+# `cluster.env` (git-ignored; copy from cluster.env.example). Precedence:
+# already-exported env  >  cluster.env  >  the generic defaults below.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF="${CLUSTER_ENV:-$SCRIPT_DIR/cluster.env}"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
 BASE_IMAGE="${BASE_IMAGE:-vllm/vllm-openai:cu130-nightly}"
 # NCCL-fixed image (system-NCCL swap, vllm#42354). Build once with `build`.
 IMAGE="${IMAGE:-vllm-spark-nccl:cu130}"
-read -r -a NODES     <<< "${NODES:-spark-0e81.local spark-0f50.local}"   # SSH hosts, head first
-read -r -a ROCE_IPS  <<< "${ROCE_IPS:-192.168.100.1 192.168.100.2}"      # RoCE IP per node
+# Node list + matching rail-0 RoCE IPs (head first), derived from cluster.env's
+# HEAD_*/WORKER_* unless NODES/ROCE_IPS were set directly.
+: "${NODES:=${HEAD_HOST:-spark-a.local} ${WORKER_HOST:-spark-b.local}}"
+: "${ROCE_IPS:=${HEAD_RAIL0_IP:-192.168.100.1} ${WORKER_RAIL0_IP:-192.168.100.2}}"
+read -r -a NODES    <<< "$NODES"
+read -r -a ROCE_IPS <<< "$ROCE_IPS"
+MASTER_IP="${MASTER_IP:-${ROCE_IPS[0]}}"     # NCCL rendezvous (head rail-0 IP)
 MASTER_PORT="${MASTER_PORT:-29500}"
-PORT="${PORT:-8000}"
+PORT="${SERVE_PORT:-${PORT:-8000}}"
 IB_HCA="${IB_HCA:-rocep1s0f0,roceP2p1s0f0}"
 IB_GID_INDEX="${IB_GID_INDEX:-3}"
 IB_IFACES="${IB_IFACES:-enp1s0f0np0,enP2p1s0f0np0}"
 GLOO_IF="${GLOO_IF:-enp1s0f0np0}"
-read -r -a UVERBS    <<< "${UVERBS:-uverbs0 uverbs1 uverbs2 uverbs3}"     # RDMA verbs devices
+read -r -a UVERBS   <<< "${UVERBS:-uverbs0 uverbs1 uverbs2 uverbs3}"     # RDMA verbs devices
 
 # Identical serve args for every node. Do NOT put --node-rank/--headless/--host/
 # --port/--nnodes/--master-*/--distributed-executor-backend here (added per node).
@@ -77,7 +88,7 @@ docker run -d --name $name --network host --gpus all --ipc=host \
   -e NCCL_SOCKET_IFNAME=$IB_IFACES -e GLOO_SOCKET_IFNAME=$GLOO_IF -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --entrypoint vllm $IMAGE serve $serve \
     --distributed-executor-backend mp --nnodes $NNODES --node-rank $i \
-    --master-addr ${ROCE_IPS[0]} --master-port $MASTER_PORT $role"
+    --master-addr $MASTER_IP --master-port $MASTER_PORT $role"
     echo ">> [$host] launching $name (rank $i)"
     $SSH "$host" "$cmd" >/dev/null
   done
