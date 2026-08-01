@@ -1,0 +1,17 @@
+# Fix the DGX Spark multi-node NCCL hang: vllm-project/vllm#42354
+#
+# On GB10 (aarch64/sm121), the pip-bundled NCCL that ships in the vLLM image
+# (nvidia-nccl-cu13, ~219 MB) hangs multi-node TP under sustained load: rank 0
+# blocks in ncclAllReduce while a peer rank spins its GPU at ~96% until the
+# collective watchdog fires. The DGX-OS *system* NCCL (~190 MB) does not.
+# Both report 2.28.9 but are different binaries (different GNU build-id).
+#
+# The official image already contains BOTH:
+#   pip:    /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2  (219 MB)
+#   system: /usr/lib/aarch64-linux-gnu/libnccl.so.2 -> libnccl.so.2.28.9          (190 MB)
+# so the fix is just to point the pip soname at the system library.
+FROM vllm/vllm-openai:cu130-nightly
+RUN set -eux; \
+    P=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2; \
+    [ -e "$P.pipbak" ] || mv "$P" "$P.pipbak"; \
+    ln -sf /usr/lib/aarch64-linux-gnu/libnccl.so.2 "$P"

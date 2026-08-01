@@ -222,10 +222,12 @@ The official image does **not** ship Ray. vLLM's native multi-node path uses the
 (`mp`)** executor with a head/worker split — no Ray required.
 
 > **Shortcut:** [`launch-dual-spark.sh`](./launch-dual-spark.sh) in this directory wraps everything
-> below — it enforces **identical engine args on every node** and maps the **RDMA devices** in, so
-> the two big foot-guns can't happen. Just `./launch-dual-spark.sh up` (built-in Nemotron-Super
-> recipe), `./launch-dual-spark.sh up -- <serve args>` for a custom model, `down`, or `status`. The
-> manual steps below document exactly what it does.
+> below — it enforces **identical engine args on every node**, maps the **RDMA devices** in, and
+> defaults to the **NCCL-fixed image** (see [4.4](#44-stability--known-issues-dgx-spark)). First
+> `./launch-dual-spark.sh build` (once, builds the fixed image on both nodes), then
+> `./launch-dual-spark.sh up` (built-in Nemotron-Super recipe), `up -- <serve args>` for a custom
+> model, `down`, or `status`. The manual steps below document exactly what it does — but for
+> multi-node you **must** use the NCCL-fixed image or it will hang (see 4.4).
 
 ### 4.0 Performance & stability flags (why the extra `docker run` bits)
 
@@ -339,11 +341,15 @@ docker run -d --name vllm-worker --network host --gpus all --ipc=host \
 
 ### 4.4 Stability & known issues (DGX Spark)
 
-- **NCCL library load-order (official image).** The official image can ship a pip `libnccl.so.2`
-  that shadows the system `libnccl2`, a known cause of **multi-node NCCL hangs** on DGX Spark
-  ([vllm#42354](https://github.com/vllm-project/vllm/issues/42354)). We didn't hit it, but if the
-  cluster hangs at init, redirect NCCL to the system soname (the `spark-vllm-docker`
-  `use-official-vllm` mod does this automatically).
+- **NCCL multi-node hang — FIXED here (required).** The official image's pip-bundled NCCL
+  (`nvidia-nccl-cu13`, ~219 MB) **hangs multi-node TP on GB10 under sustained load** — rank 0 blocks
+  in `ncclAllReduce` while a peer rank spins its GPU at ~96 % until the collective watchdog fires
+  ([vllm#42354](https://github.com/vllm-project/vllm/issues/42354)). **We hit this reproducibly.**
+  The image also ships the DGX-OS **system NCCL** (~190 MB, `/usr/lib/aarch64-linux-gnu/libnccl.so.2`)
+  which does *not* hang (both report 2.28.9 but are different binaries). Fix = point the pip soname
+  at the system lib: see [`Dockerfile.nccl-fix`](./Dockerfile.nccl-fix). Build it once with
+  `./launch-dual-spark.sh build` (the launcher then runs the fixed `vllm-spark-nccl:cu130` image by
+  default). **Verified:** the exact request that hung twice on the stock image ran clean afterward.
 - **Driver:** use **580.x** — 590.x has a CUDA-graph capture deadlock on GB10 unified memory. Keep
   both nodes on the **same** driver version (mismatched minors are best avoided).
 - **Firmware sudden-shutdown under heavy inference:** if a node power-cycles under load, cap the GPU

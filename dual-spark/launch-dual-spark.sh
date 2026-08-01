@@ -11,6 +11,7 @@
 # --host/--port (head), and VLLM_HOST_IP. Everything else is identical.
 #
 # Usage:
+#   ./launch-dual-spark.sh build                  # build the system-NCCL-fixed image (once)
 #   ./launch-dual-spark.sh up                     # built-in Nemotron-Super recipe
 #   ./launch-dual-spark.sh up -- <serve args...>  # custom (identical on all nodes)
 #   ./launch-dual-spark.sh down
@@ -21,7 +22,10 @@
 #   IB_HCA, IB_GID_INDEX, IB_IFACES, GLOO_IF, UVERBS
 set -euo pipefail
 
-IMAGE="${IMAGE:-vllm/vllm-openai:cu130-nightly}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_IMAGE="${BASE_IMAGE:-vllm/vllm-openai:cu130-nightly}"
+# NCCL-fixed image (system-NCCL swap, vllm#42354). Build once with `build`.
+IMAGE="${IMAGE:-vllm-spark-nccl:cu130}"
 read -r -a NODES     <<< "${NODES:-spark-0e81.local spark-0f50.local}"   # SSH hosts, head first
 read -r -a ROCE_IPS  <<< "${ROCE_IPS:-192.168.100.1 192.168.100.2}"      # RoCE IP per node
 MASTER_PORT="${MASTER_PORT:-29500}"
@@ -42,6 +46,17 @@ name_for() { [ "$1" -eq 0 ] && echo vllm-head || { [ "$NNODES" -gt 2 ] && echo "
 
 dev_args() { local a="--device=/dev/infiniband/rdma_cm"; for u in "${UVERBS[@]}"; do a="$a --device=/dev/infiniband/$u"; done; echo "$a"; }
 cache_args() { echo "-v ~/.cache/huggingface:/root/.cache/huggingface -v ~/.cache/vllm:/root/.cache/vllm -v ~/.cache/flashinfer:/root/.cache/flashinfer -v ~/.triton:/root/.triton -v ~/.tilelang:/root/.tilelang"; }
+
+cmd_build() {
+  # Build the system-NCCL-fixed image on every node (fixes multi-node hang, vllm#42354).
+  local i
+  for i in "${!NODES[@]}"; do
+    echo ">> [${NODES[$i]}] building $IMAGE from $BASE_IMAGE (system-NCCL swap)"
+    $SSH "${NODES[$i]}" "docker build -t $IMAGE -" < "$SCRIPT_DIR/Dockerfile.nccl-fix" >/dev/null
+    $SSH "${NODES[$i]}" "docker run --rm --entrypoint bash $IMAGE -lc 'readlink -f /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2'" \
+      | sed 's/^/   nccl -> /'
+  done
+}
 
 cmd_up() {
   local serve="$*"; [ -z "$serve" ] && serve="$DEFAULT_SERVE_ARGS"
@@ -81,8 +96,9 @@ cmd_status() {
 action="${1:-up}"; shift || true
 [ "${1:-}" = "--" ] && shift || true
 case "$action" in
+  build) cmd_build;;
   up) cmd_up "$@";;
   down) cmd_down;;
   status) cmd_status;;
-  *) echo "usage: $0 {up [-- <serve args>]|down|status}" >&2; exit 1;;
+  *) echo "usage: $0 {build|up [-- <serve args>]|down|status}" >&2; exit 1;;
 esac
