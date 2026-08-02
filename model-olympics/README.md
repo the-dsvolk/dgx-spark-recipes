@@ -24,8 +24,11 @@ as indicative, not benchmark-grade).
 | 1 | Thread-safe LRU cache + TTL | ✅ **Excellent** — clean, capacity-validated, `cleanup()` returns removed-count · 40 s | ✅ **Best-engineered** — fully typed + docstrings, `_is_expired` helper (single lookup), in-place update · 131 s | ✅ **Good** — correct + documented; minor smells: `expiry` set before lock, `__len__` mutates · 9 s |
 | 2 | Word Ladder II (LeetCode 126, hard) | ✅ **18/18** — perfect (auto-graded) · 87 s | ✅ **18/18** — perfect (auto-graded) · 135 s | ⚠️ **17/18** — missed `red→tax` (a multi-solution case) · 34 s |
 | 3 | Thread-safe **O(1) LFU** cache (LeetCode 460, hard + concurrency + complexity) | ✅ **full pass** — `OrderedDict` buckets + `RLock`; concise, fastest ops (0.08 s/400k) · 78 s | ✅ **full pass** — textbook hand-rolled doubly-linked-list O(1) + `RLock`; most rigorous · 113 s | ✅ **full pass** — `OrderedDict` + plain `Lock` (non-reentrant, less defensive); concise · 38 s |
+| 4 | **Async** token-bucket rate limiter (`asyncio`) | ✅ **full pass** — `asyncio.Lock` + computed-sleep (no busy-wait); 41 lines · 56 s | ✅ **full pass** — clean while-loop, sleeps outside the lock; 33 lines · 56 s | ✅ **full pass** — most concise (28 lines), same correct pattern · 31 s |
 
 *(Task 3 "full pass" = all three auto-graded checks passed: functional correctness vs a verified O(1) reference over random op sequences, a 16-thread concurrency stress test with no crash/deadlock, and a complexity check of 400k ops completing in <0.25 s — i.e. genuinely O(1), no scanning.)*
+
+*(Task 4 "full pass" = all three async timing checks passed: refill rate (~0.5 s to refill 5 tokens @10/s), concurrent burst+sustained (25 concurrent acquires ≈ 2.0 s), and a rate-cap check (~14 grants in 1 s — a broken limiter would grant thousands). All three used `asyncio.Lock` + a computed `asyncio.sleep` outside the lock, i.e. no busy-wait.)*
 
 All Task-1 outputs were correct and thread-safe; differences are polish/efficiency. Task 2 was
 auto-graded by comparing each model's *set* of shortest transformation sequences against a verified
@@ -37,7 +40,11 @@ tasks), with `qwen-coder` reaching it ~1.5× faster. `qwen3.6` is consistently f
 slightly less reliable (one wrong answer on Word Ladder II; a non-reentrant `Lock` choice on LFU).
 On the hard concurrency+complexity task all three produced a correct thread-safe O(1) LFU — Nemotron
 with the most rigorous (real doubly-linked-list) implementation, `qwen-coder` the best balance of
-concision and speed.
+concision and speed. On the async task (Task 4) all three again produced a correct token bucket
+(`asyncio.Lock` + computed sleep, no busy-wait) — no correctness separation; `qwen3.6` was most
+concise and fastest to generate. **Net so far:** correctness is nearly saturated (only `qwen3.6`'s
+single Word-Ladder-II miss); the real spread is **speed** (`qwen3.6` > `qwen-coder` > `nemotron`) and
+**rigor/polish** (`nemotron` ≥ `qwen-coder` > `qwen3.6`).
 
 ## Prompts (exact)
 
@@ -74,6 +81,24 @@ Requirements:
 - get and put must be O(1) average time (use frequency buckets of doubly-linked lists / ordered maps + a min-frequency pointer; do NOT scan all keys).
 - Thread-safe for concurrent get/put from many threads.
 - capacity may be 0 (then nothing is ever stored; get always returns -1).
+Return ONLY the complete Python (imports + class). No explanation.
+```
+
+### Task 4 — Async token-bucket rate limiter (asyncio)
+```
+Implement an ASYNC token-bucket rate limiter using asyncio. Implement EXACTLY this class:
+
+class AsyncRateLimiter:
+    def __init__(self, rate: float, capacity: float):
+        # rate = tokens refilled per second; capacity = max tokens (burst size)
+    async def acquire(self, tokens: float = 1.0) -> None:
+        # wait until `tokens` are available, consume them, then return
+
+Requirements:
+- Token bucket: refills continuously at `rate` tokens/sec up to `capacity`; starts FULL.
+- acquire(n) awaits until n tokens are available, then consumes them.
+- Safe for many coroutines awaiting concurrently; NO busy-wait polling loop — use asyncio primitives and sleep for the computed wait time.
+- Use a monotonic clock (time.monotonic or loop.time()).
 Return ONLY the complete Python (imports + class). No explanation.
 ```
 
