@@ -23,15 +23,21 @@ as indicative, not benchmark-grade).
 |---|---|---|---|---|
 | 1 | Thread-safe LRU cache + TTL | ✅ **Excellent** — clean, capacity-validated, `cleanup()` returns removed-count · 40 s | ✅ **Best-engineered** — fully typed + docstrings, `_is_expired` helper (single lookup), in-place update · 131 s | ✅ **Good** — correct + documented; minor smells: `expiry` set before lock, `__len__` mutates · 9 s |
 | 2 | Word Ladder II (LeetCode 126, hard) | ✅ **18/18** — perfect (auto-graded) · 87 s | ✅ **18/18** — perfect (auto-graded) · 135 s | ⚠️ **17/18** — missed `red→tax` (a multi-solution case) · 34 s |
+| 3 | Thread-safe **O(1) LFU** cache (LeetCode 460, hard + concurrency + complexity) | ✅ **full pass** — `OrderedDict` buckets + `RLock`; concise, fastest ops (0.08 s/400k) · 78 s | ✅ **full pass** — textbook hand-rolled doubly-linked-list O(1) + `RLock`; most rigorous · 113 s | ✅ **full pass** — `OrderedDict` + plain `Lock` (non-reentrant, less defensive); concise · 38 s |
+
+*(Task 3 "full pass" = all three auto-graded checks passed: functional correctness vs a verified O(1) reference over random op sequences, a 16-thread concurrency stress test with no crash/deadlock, and a complexity check of 400k ops completing in <0.25 s — i.e. genuinely O(1), no scanning.)*
 
 All Task-1 outputs were correct and thread-safe; differences are polish/efficiency. Task 2 was
 auto-graded by comparing each model's *set* of shortest transformation sequences against a verified
 reference over fixed LeetCode examples + random small-alphabet graphs (degenerate `beginWord ==
 endWord` inputs excluded — LC 126 disallows them).
 
-**Running read:** `qwen-coder` and `nemotron` are tied on correctness (both flawless so far), with
-`qwen-coder` reaching it ~1.5× faster; `qwen3.6` is fastest but took its first correctness ding on
-the harder graph task.
+**Running read:** `qwen-coder` and `nemotron` are tied on correctness (both flawless across all 3
+tasks), with `qwen-coder` reaching it ~1.5× faster. `qwen3.6` is consistently fastest but has been
+slightly less reliable (one wrong answer on Word Ladder II; a non-reentrant `Lock` choice on LFU).
+On the hard concurrency+complexity task all three produced a correct thread-safe O(1) LFU — Nemotron
+with the most rigorous (real doubly-linked-list) implementation, `qwen-coder` the best balance of
+concision and speed.
 
 ## Prompts (exact)
 
@@ -53,6 +59,22 @@ Solve LeetCode 126 'Word Ladder II'. Given beginWord, endWord, and wordList, ret
 def findLadders(beginWord: str, endWord: str, wordList: list[str]) -> list[list[str]]:
 
 Return ONLY the complete Python (imports + function). No explanation.
+```
+
+### Task 3 — Thread-safe O(1) LFU cache (LeetCode 460 + concurrency + complexity)
+```
+Design a THREAD-SAFE LFU (Least Frequently Used) cache with O(1) average time for both operations. Implement EXACTLY this class:
+
+class LFUCache:
+    def __init__(self, capacity: int): ...
+    def get(self, key: int) -> int:            # value, or -1 if absent; a hit counts as a use
+    def put(self, key: int, value: int) -> None:  # insert/update; on overflow evict the least-frequently-used key, breaking ties by least-recently-used
+
+Requirements:
+- get and put must be O(1) average time (use frequency buckets of doubly-linked lists / ordered maps + a min-frequency pointer; do NOT scan all keys).
+- Thread-safe for concurrent get/put from many threads.
+- capacity may be 0 (then nothing is ever stored; get always returns -1).
+Return ONLY the complete Python (imports + class). No explanation.
 ```
 
 ---
