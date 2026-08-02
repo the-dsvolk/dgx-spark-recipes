@@ -43,6 +43,7 @@ cmd_up() {
   esac
   local cmd="docker rm -f $NAME >/dev/null 2>&1; mkdir -p ~/.cache/vllm ~/.cache/flashinfer ~/.triton ~/.tilelang; \
 docker run -d --name $NAME --network host --gpus all --ipc=host \
+  --restart unless-stopped \
   --log-opt max-size=50m --log-opt max-file=3 \
   --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 \
   $(cache_args) \
